@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: esl-speech-worker-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+  storageClassName: local-path
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: esl-speech-worker-models
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+  storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: esl-speech-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: esl-speech-worker
+  template:
+    metadata:
+      labels:
+        app: esl-speech-worker
+    spec:
+      # If your k3s+containerd GPU setup uses a RuntimeClass, uncomment and set it:
+      # runtimeClassName: nvidia
+      containers:
+        - name: esl-speech-worker
+          image: IMAGE_HERE
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            - name: KOKORO_MODEL_PATH
+              value: /models/kokoro-v1.0.onnx
+            - name: KOKORO_VOICES_PATH
+              value: /models/voices-v1.0.bin
+            - name: WHISPER_MODEL_NAME
+              value: tiny.en
+            - name: WHISPER_VAD_METHOD
+              value: silero
+            - name: HF_HOME
+              value: /cache/huggingface
+            - name: TRANSFORMERS_CACHE
+              value: /cache/huggingface/transformers
+            - name: XDG_CACHE_HOME
+              value: /cache
+          volumeMounts:
+            - name: cache
+              mountPath: /cache
+            - name: models
+              mountPath: /models
+              readOnly: true
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "6Gi"
+            requests:
+              memory: "2Gi"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 2
+            failureThreshold: 180
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8000
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: esl-speech-worker-cache
+        - name: models
+          persistentVolumeClaim:
+            claimName: esl-speech-worker-models
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: esl-speech-worker
+spec:
+  selector:
+    app: esl-speech-worker
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP
+

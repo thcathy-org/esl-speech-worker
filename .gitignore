@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.env
+.env.*
+
+kokoro-v1.0.onnx
+voices-v1.0.bin
+
+*.log
+*.wav
+*.mp3
+word_timestamps.json
