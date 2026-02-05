@@ -4,7 +4,7 @@ FastAPI service that generates TTS audio with **Kokoro ONNX** and produces **wor
 
 ## What it does
 
-- **Input**: text (+ options like `speed`, `voice`, `speak_punctuation`)
+- **Input**: text (+ options like `speed`, `voice`). If you need “speak punctuation”, transform the text before calling this API.
 - **Output**: base64 audio (`mp3` by default, or `wav`) + `word_timestamps`
 
 ## Requirements
@@ -55,7 +55,6 @@ Request JSON fields:
 ```json
 {
   "text": "Hello world.",
-  "speak_punctuation": false,
   "voice": "af_sarah",
   "speed": 0.9,
   "audio_format": "mp3",
@@ -66,6 +65,8 @@ Request JSON fields:
 - `speed`: 1.0 default, <1.0 slower, >1.0 faster (clamped to 0.5–1.5)
 - `audio_format`: `"mp3"` (default) or `"wav"`
 - `mp3_quality`: 0..9 (0 best, 9 worst), used only when `audio_format="mp3"`
+ 
+Note: the service no longer transforms punctuation. If you need a “speak punctuation” variant, pre-transform the input text on the caller side.
 
 Response JSON fields (subset):
 
