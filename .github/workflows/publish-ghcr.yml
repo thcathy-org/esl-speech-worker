@@ -48,7 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           xy="$(tr -d ' \t\r\n' < VERSION)"
-          if [[ ! "$xy" =~ ^[0-9]+\\.[0-9]+$ ]]; then
+          if [[ ! "$xy" =~ ^[0-9]+\.[0-9]+$ ]]; then
             echo "VERSION must be X.Y (e.g. 1.3). Got: '$xy'" >&2
             exit 1
           fi
