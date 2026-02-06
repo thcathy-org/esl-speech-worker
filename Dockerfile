@@ -1,5 +1,8 @@
 FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
 
+# Prevent tzdata from prompting during apt installs
+ENV DEBIAN_FRONTEND=noninteractive
+
 WORKDIR /app
 
 ENV HF_HOME=/cache/huggingface \
