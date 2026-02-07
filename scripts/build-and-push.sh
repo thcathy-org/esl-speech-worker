@@ -20,11 +20,26 @@ if [[ -z "$TAG" ]]; then
     echo "VERSION file not found. Provide an explicit tag or create VERSION." >&2
     exit 1
   fi
-  TAG="$(tr -d ' \t\r\n' < VERSION)"
-  if [[ -z "$TAG" ]]; then
+  current="$(tr -d ' \t\r\n' < VERSION)"
+  if [[ -z "$current" ]]; then
     echo "VERSION file is empty. Provide an explicit tag." >&2
     exit 1
   fi
+  IFS='.' read -r -a parts <<< "$current"
+  if [[ "${#parts[@]}" -lt 2 ]]; then
+    echo "VERSION must be at least X.Y (got: '$current')." >&2
+    exit 1
+  fi
+  last_index=$(( ${#parts[@]} - 1 ))
+  last_value="${parts[$last_index]}"
+  if ! [[ "$last_value" =~ ^[0-9]+$ ]]; then
+    echo "VERSION last segment must be numeric (got: '$current')." >&2
+    exit 1
+  fi
+  parts[$last_index]=$(( last_value + 1 ))
+  TAG="$(IFS='.'; echo "${parts[*]}")"
+  echo "$TAG" > VERSION
+  echo "Bumped VERSION to $TAG"
 fi
 
 IMAGE_NAME="${IMAGE_NAME:-esl-speech-worker}"

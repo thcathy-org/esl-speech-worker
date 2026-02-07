@@ -3,13 +3,14 @@ import logging
 import hmac
 import subprocess
 import asyncio
-import time
+import base64
+import tempfile
+from typing import Optional
+
 import soundfile as sf
-import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
-from typing import Optional
 
 from kokoro_onnx import Kokoro
 import whisperx
@@ -25,29 +26,86 @@ align_metadata = None
 whisper_model = None
 models_loaded = False
 models_lock = asyncio.Lock()
-last_request_at = None
 
-_device_override = os.getenv("ESL_SPEECH_WORKER_DEVICE", "").strip().lower()
-if _device_override in {"cpu", "cuda"}:
-    device = _device_override
-else:
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-lazy_load_models = os.getenv("ESL_SPEECH_WORKER_LAZY_LOAD", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-idle_timeout_seconds = int(os.getenv("ESL_SPEECH_WORKER_IDLE_TIMEOUT_SECONDS", "0").strip() or "0")
 API_KEY = os.getenv("ESL_SPEECH_WORKER_API_KEY", "")
-
-# Kokoro assets are not shipped via PyPI; you must provide them.
 KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "kokoro-v1.0.onnx")
 KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "voices-v1.0.bin")
 DEFAULT_VOICE = "af_sarah"
 WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "tiny.en")
 WHISPER_VAD_METHOD = os.getenv("WHISPER_VAD_METHOD", "silero")
+
+def _resolve_device() -> str:
+    forced = os.getenv("ESL_SPEECH_WORKER_DEVICE", "").strip().lower()
+    if forced in ("cpu", "cuda"):
+        return forced
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+device = _resolve_device()
+
+def _clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+def _safe_remove(path: str) -> None:
+    if path and os.path.exists(path):
+        os.remove(path)
+
+def _require_api_key(request_obj: Request) -> None:
+    if not API_KEY:
+        return
+    provided = request_obj.headers.get("x-api-key", "")
+    if not provided or not hmac.compare_digest(provided, API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+def _encode_audio(
+    audio_format: str,
+    wav_path: str,
+    mp3_quality: Optional[int],
+) -> tuple[bytes, str]:
+    audio_format = (audio_format or "mp3").lower().strip()
+    if audio_format not in {"mp3", "wav"}:
+        raise HTTPException(status_code=400, detail="audio_format must be 'mp3' or 'wav'")
+
+    if audio_format == "wav":
+        with open(wav_path, "rb") as f:
+            return f.read(), "audio/wav"
+
+    try:
+        q = int(mp3_quality) if mp3_quality is not None else 4
+        q = _clamp(q, 0, 9)
+    except Exception:
+        q = 4
+
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
+        mp3_path = tmp_mp3.name
+
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                wav_path,
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                str(q),
+                mp3_path,
+            ],
+            check=True,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=500, detail="ffmpeg not found (required for mp3 output)")
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"ffmpeg mp3 encode failed: {e}")
+
+    try:
+        with open(mp3_path, "rb") as f:
+            return f.read(), "audio/mpeg"
+    finally:
+        _safe_remove(mp3_path)
 
 @app.get("/healthz")
 async def healthz():
@@ -58,7 +116,6 @@ async def healthz():
         "ok": True,
         "device": device,
         "cuda_available": torch.cuda.is_available(),
-        "lazy_load": lazy_load_models,
         "models_loaded": models_loaded,
     }
 
@@ -68,7 +125,7 @@ async def readyz():
     Readiness probe: models are loaded and service can handle requests.
     """
     ready = bool(kokoro) and bool(align_model) and bool(whisper_model)
-    if not ready and not lazy_load_models:
+    if not ready:
         raise HTTPException(status_code=503, detail="Not ready: models not loaded")
     return {"ok": True, "models_loaded": ready}
 
@@ -106,7 +163,7 @@ def _load_models():
     try:
         align_model, align_metadata = whisperx.load_align_model(
             language_code="en",
-            device=device
+            device=device,
         )
         logger.info("WhisperX Alignment model loaded.")
     except Exception as e:
@@ -129,17 +186,6 @@ def _load_models():
 
     models_loaded = bool(kokoro) and bool(align_model) and bool(whisper_model)
 
-def _unload_models():
-    global kokoro, align_model, align_metadata, whisper_model, models_loaded
-    kokoro = None
-    align_model = None
-    align_metadata = None
-    whisper_model = None
-    models_loaded = False
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    logger.info("Models unloaded due to idle timeout.")
-
 async def _ensure_models_loaded():
     if models_loaded:
         return
@@ -148,36 +194,13 @@ async def _ensure_models_loaded():
             return
         await asyncio.to_thread(_load_models)
 
-async def _idle_unload_loop():
-    if idle_timeout_seconds <= 0:
-        return
-    check_interval = max(5, min(30, idle_timeout_seconds // 3))
-    while True:
-        await asyncio.sleep(check_interval)
-        if not models_loaded or last_request_at is None:
-            continue
-        idle_for = time.monotonic() - last_request_at
-        if idle_for >= idle_timeout_seconds:
-            async with models_lock:
-                if models_loaded and last_request_at is not None:
-                    idle_for = time.monotonic() - last_request_at
-                    if idle_for >= idle_timeout_seconds:
-                        await asyncio.to_thread(_unload_models)
-
 @app.on_event("startup")
 async def startup_event():
-    if lazy_load_models:
-        logger.info("Lazy model loading enabled; deferring model load until first request.")
-    else:
-        await _ensure_models_loaded()
-    if idle_timeout_seconds > 0:
-        logger.info(f"Idle unload enabled: {idle_timeout_seconds}s")
-        asyncio.create_task(_idle_unload_loop())
+    await _ensure_models_loaded()
 
 class GenerateRequest(BaseModel):
     text: str
     voice: Optional[str] = DEFAULT_VOICE
-    speak_punctuation: Optional[bool] = False
     speed: Optional[float] = 1.0
     audio_format: Optional[str] = "mp3"
     mp3_quality: Optional[int] = 4
@@ -187,24 +210,18 @@ async def generate_audio(
     request_obj: Request,
     request: GenerateRequest,
 ):
-    global last_request_at
-    last_request_at = time.monotonic()
     if not kokoro or not align_model or not whisper_model:
         await _ensure_models_loaded()
     if not kokoro or not align_model or not whisper_model:
         raise HTTPException(status_code=503, detail="Models not loaded")
-    if API_KEY:
-        provided = request_obj.headers.get("x-api-key", "")
-        if not provided or not hmac.compare_digest(provided, API_KEY):
-            raise HTTPException(status_code=401, detail="Invalid API key")
+    _require_api_key(request_obj)
 
     processed_text = request.text
     logger.info(f"Generating audio for: {processed_text[:50]}...")
 
     try:
         speed = request.speed if request.speed is not None else 1.0
-        speed = float(speed)
-        speed = max(0.5, min(1.5, speed))
+        speed = _clamp(float(speed), 0.5, 1.5)
 
         samples, sample_rate = kokoro.create(
             processed_text,
@@ -216,87 +233,43 @@ async def generate_audio(
         logger.error(f"TTS Generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-    import tempfile
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
         sf.write(tmp_audio.name, samples, sample_rate)
         tmp_path = tmp_audio.name
-    tmp_mp3_path = None
-
     try:
         # WhisperX alignment expects segments; we transcribe first, then align.
-        batch_size = 16 
+        batch_size = 16
 
         audio = whisperx.load_audio(tmp_path)
         
         result = whisper_model.transcribe(audio, batch_size=batch_size)
-        
+
         result_aligned = whisperx.align(
-            result["segments"], 
-            align_model, 
-            align_metadata, 
-            audio, 
-            device, 
+            result["segments"],
+            align_model,
+            align_metadata,
+            audio,
+            device,
             return_char_alignments=False
         )
-        
+
         timestamps = result_aligned["word_segments"]
-        
     except Exception as e:
         logger.error(f"Alignment failed: {e}")
-        if os.path.exists(tmp_path): os.remove(tmp_path)
+        _safe_remove(tmp_path)
         raise HTTPException(status_code=500, detail=f"Alignment failed: {str(e)}")
 
-    audio_format = (request.audio_format or "mp3").lower().strip()
-    if audio_format not in {"mp3", "wav"}:
-        if os.path.exists(tmp_path): os.remove(tmp_path)
-        raise HTTPException(status_code=400, detail="audio_format must be 'mp3' or 'wav'")
+    try:
+        audio_bytes, mime_type = _encode_audio(
+            request.audio_format,
+            tmp_path,
+            request.mp3_quality,
+        )
+        audio_format = (request.audio_format or "mp3").lower().strip()
+    finally:
+        _safe_remove(tmp_path)
 
-    if audio_format == "wav":
-        with open(tmp_path, "rb") as f:
-            audio_bytes = f.read()
-        mime_type = "audio/wav"
-    else:
-        try:
-            q = int(request.mp3_quality) if request.mp3_quality is not None else 4
-            q = max(0, min(9, q))
-        except Exception:
-            q = 4
-
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_mp3:
-            tmp_mp3_path = tmp_mp3.name
-
-        try:
-            subprocess.run(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    tmp_path,
-                    "-codec:a",
-                    "libmp3lame",
-                    "-q:a",
-                    str(q),
-                    tmp_mp3_path,
-                ],
-                check=True,
-            )
-        except FileNotFoundError:
-            raise HTTPException(status_code=500, detail="ffmpeg not found (required for mp3 output)")
-        except subprocess.CalledProcessError as e:
-            raise HTTPException(status_code=500, detail=f"ffmpeg mp3 encode failed: {e}")
-
-        with open(tmp_mp3_path, "rb") as f:
-            audio_bytes = f.read()
-        mime_type = "audio/mpeg"
-    
-    import base64
-    audio_b64 = base64.b64encode(audio_bytes).decode('utf-8')
-    
-    if os.path.exists(tmp_path): os.remove(tmp_path)
-    if tmp_mp3_path and os.path.exists(tmp_mp3_path): os.remove(tmp_mp3_path)
+    audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
     return {
         "audio_base64": audio_b64,
@@ -305,5 +278,5 @@ async def generate_audio(
         "sample_rate": sample_rate,
         "word_timestamps": timestamps,
         "original_text": request.text,
-        "processed_text": processed_text
+        "processed_text": processed_text,
     }
