@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
+FROM docker.io/pytorch/pytorch:2.1.2-cuda12.1-cudnn8-runtime
 
 # Prevent tzdata from prompting during apt installs
 ENV DEBIAN_FRONTEND=noninteractive
@@ -9,18 +9,14 @@ ENV HF_HOME=/cache/huggingface \
     TRANSFORMERS_CACHE=/cache/huggingface/transformers \
     XDG_CACHE_HOME=/cache
 
-RUN apt-get update && apt-get install -y \
-    git \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    curl \
     libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-
-RUN python -c "import torch; print('torch', torch.__version__, 'cuda', torch.version.cuda, 'cuda_available', torch.cuda.is_available())"
 
 COPY app.py .
 # Kokoro assets must be provided (volume mount or baked into image):

@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: esl-speech-worker
+  namespace: esl-speech-worker
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: esl-speech-worker-esl-speech-worker-prefix-remover@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+    - secretName: esl-speech-worker-tls
+      hosts:
+        - homeserver.funfunspell.com
+  rules:
+    - host: homeserver.funfunspell.com
+      http:
+        paths:
+          - path: /esl-speech-worker
+            pathType: Prefix
+            backend:
+              service:
+                name: esl-speech-worker
+                port:
+                  name: http
+
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: esl-speech-worker-prefix-remover
+  namespace: esl-speech-worker
+spec:
+  stripPrefix:
+    prefixes:
+      - /esl-speech-worker
+

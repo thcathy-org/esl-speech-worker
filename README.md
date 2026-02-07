@@ -1,142 +1,99 @@
 # ESL Speech Worker
 
-FastAPI service that generates TTS audio with **Kokoro ONNX** and produces **word-level timestamps** via **WhisperX alignment**.
+FastAPI service that generates TTS audio and word-level timestamps (Kokoro + WhisperX).
 
-## What it does
+This service is supporting https://www.funfunspell.com - a free platform for English dictation and learning vocabulary
 
-- **Input**: text (+ options like `speed`, `voice`). If you need “speak punctuation”, transform the text before calling this API.
-- **Output**: base64 audio (`mp3` by default, or `wav`) + `word_timestamps`
-
-## Requirements
-
-- Python 3.10+ (tested with 3.12)
-- `ffmpeg` available on PATH (**required** for `audio_format="mp3"`)
-- Enough RAM/disk for Whisper/WhisperX model caches
-- Optional: NVIDIA GPU + CUDA for faster alignment (WhisperX)
-
-## Model assets (required)
-
-This repo does **not** include Kokoro model assets. Place these files next to `app.py` (or point to them via env vars):
-
-- `kokoro-v1.0.onnx`
-- `voices-v1.0.bin`
-
-Download (from `thewh1teagle/kokoro-onnx` model releases):
+## Quick call example
 
 ```bash
-curl -L -o kokoro-v1.0.onnx https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx
-curl -L -o voices-v1.0.bin https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+curl -sS -f https://<your-host>/esl-speech-worker/generate \
+  -H 'content-type: application/json' \
+  -H 'X-API-KEY: <key>' \
+  -d '{"text":"Hello world.","voice":"af_sarah","speed":0.9,"audio_format":"mp3"}'
 ```
 
-## Local run (venv)
+## API (POST /generate)
+
+Request JSON:
+
+- `text` (required): input text
+- `voice` (optional): voice ID (e.g. `af_sarah`)
+- `speed` (optional): 0.5–1.5, default 1.0
+- `audio_format` (optional): `mp3` (default) or `wav`
+- `mp3_quality` (optional): 0..9 (0 best, 9 worst), used only for `mp3`
+
+If `ESL_SPEECH_WORKER_API_KEY` is set, include header `X-API-KEY: <key>`.
+
+Minimal steps to build and run the service in Kubernetes.
+
+## 1) Build the image (local, for k3s/containerd)
 
 ```bash
 cd esl-speech-worker
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -U pip
-
-pip install -r requirements.txt
-pip install "whisperx==3.7.4"
-
-uvicorn app:app --host 0.0.0.0 --port 8000
+chmod +x scripts/build-and-push.sh
+./scripts/build-and-push.sh
 ```
 
-Notes:
-- On first start, WhisperX may download models into your cache (can take time).
-- The worker preloads WhisperX models at startup so requests are not blocked by downloads.
+This builds `localhost/esl-speech-worker:<VERSION>` and imports it into k3s containerd.
 
-## API
+## 2) Create PVCs (namespace: esl-speech-worker)
 
-### `POST /generate`
+```bash
+kubectl apply -f k8s/k8s-esl-rest-pvc.yaml
+```
 
-Request JSON fields:
+## 3) Copy model assets into the PVC
 
-```json
+```bash
+kubectl run model-uploader -n esl-speech-worker --image=alpine --restart=Never \
+  --overrides='
 {
-  "text": "Hello world.",
-  "voice": "af_sarah",
-  "speed": 0.9,
-  "audio_format": "mp3",
-  "mp3_quality": 4
-}
+  "spec": {
+    "containers": [{
+      "name": "model-uploader",
+      "image": "alpine",
+      "command": ["sleep","3600"],
+      "volumeMounts": [{"name":"models","mountPath":"/models"}]
+    }],
+    "volumes": [{"name":"models","persistentVolumeClaim":{"claimName":"esl-speech-worker-models"}}]
+  }
+}'
+
+kubectl cp -n esl-speech-worker kokoro-v1.0.onnx model-uploader:/models/
+kubectl cp -n esl-speech-worker voices-v1.0.bin model-uploader:/models/
+kubectl delete pod -n esl-speech-worker model-uploader
 ```
 
-- `speed`: 1.0 default, <1.0 slower, >1.0 faster (clamped to 0.5–1.5)
-- `audio_format`: `"mp3"` (default) or `"wav"`
-- `mp3_quality`: 0..9 (0 best, 9 worst), used only when `audio_format="mp3"`
- 
-Note: the service no longer transforms punctuation. If you need a “speak punctuation” variant, pre-transform the input text on the caller side.
-
-Response JSON fields (subset):
-
-```json
-{
-  "audio_base64": "....",
-  "audio_format": "mp3",
-  "mime_type": "audio/mpeg",
-  "sample_rate": 24000,
-  "word_timestamps": [
-    { "word": "Hello", "start": 0.12, "end": 0.42, "score": 0.87 }
-  ]
-}
-```
-
-## Save audio + timestamps (manual testing)
-
-### Save MP3 + timestamps
+## 4) Create API key secret (optional but recommended)
 
 ```bash
-curl -sS -f http://localhost:8000/generate \
-  -H 'content-type: application/json' \
-  -d '{"text":"Hello world. This is an mp3 test.","speed":0.9,"audio_format":"mp3","mp3_quality":4}' \
-| python3 -c 'import sys,json,base64; d=json.load(sys.stdin); open("out.mp3","wb").write(base64.b64decode(d["audio_base64"])); open("word_timestamps.json","w",encoding="utf-8").write(json.dumps(d["word_timestamps"], indent=2)); print("wrote out.mp3 and word_timestamps.json")'
+kubectl create secret generic esl-speech-worker-api-key \
+  -n esl-speech-worker \
+  --from-literal=api-key='<your-secret>'
 ```
 
-### Save WAV + timestamps
+## 5) Deploy (Deployment + Service)
 
 ```bash
-curl -sS -f http://localhost:8000/generate \
-  -H 'content-type: application/json' \
-  -d '{"text":"Hello world. This is a wav test.","speed":0.9,"audio_format":"wav"}' \
-| python3 -c 'import sys,json,base64; d=json.load(sys.stdin); open("out.wav","wb").write(base64.b64decode(d["audio_base64"])); open("word_timestamps.json","w",encoding="utf-8").write(json.dumps(d["word_timestamps"], indent=2)); print("wrote out.wav and word_timestamps.json")'
+kubectl apply -f k8s/k8s-esl-rest-deploy.yaml -n esl-speech-worker
 ```
 
-## Configuration (env vars)
-
-- `KOKORO_MODEL_PATH`: path to `kokoro-*.onnx` (default `kokoro-v1.0.onnx`)
-- `KOKORO_VOICES_PATH`: path to `voices-*.bin` (default `voices-v1.0.bin`)
-- `WHISPER_MODEL_NAME`: Whisper model name (default `tiny.en`)
-- `WHISPER_VAD_METHOD`: WhisperX VAD method (default `silero`)
-
-Example:
+## 6) Ingress (Traefik)
 
 ```bash
-KOKORO_MODEL_PATH=/models/kokoro-v1.0.onnx \
-KOKORO_VOICES_PATH=/models/voices-v1.0.bin \
-WHISPER_MODEL_NAME=tiny.en \
-WHISPER_VAD_METHOD=silero \
-uvicorn app:app --host 0.0.0.0 --port 8000
+kubectl apply -f k8s/k8s-esl-rest-ingress.yaml -n esl-speech-worker
 ```
 
-## Docker
-
-This folder includes a `Dockerfile`. It installs `ffmpeg` and runs uvicorn.
-
-By default the image **does not COPY** Kokoro assets, so either:
-
-- Mount them at runtime:
+Test:
 
 ```bash
-docker build -t esl-speech-worker .
-docker run --rm -p 8000:8000 -v "$PWD:/app" esl-speech-worker
+curl -sS https://homeserver.funfunspell.com/esl-speech-worker/healthz
 ```
 
-- Or bake the assets into the image (edit `Dockerfile` and `COPY` them).
+## Notes
 
-## Troubleshooting
-
-- **`503 Models not loaded`**: Kokoro assets missing or WhisperX failed to load. Check logs and ensure the two Kokoro files exist.
-- **MP3 output errors**: ensure `ffmpeg` is installed and on PATH.
-- **Pyannote / torch weights_only errors**: keep `WHISPER_VAD_METHOD=silero` (default).
+- Image tag used in `k8s/k8s-esl-rest-deploy.yaml` must match the local image tag (e.g. `localhost/esl-speech-worker:1.0.1`).
+- If `ESL_SPEECH_WORKER_API_KEY` is set, `/generate` requires header `X-API-KEY: <key>`.
+- If you rebuild the image with the same tag, Kubernetes will keep the old pod. Either bump the tag and `kubectl apply`, or run `kubectl rollout restart deploy/esl-speech-worker -n esl-speech-worker`.
 

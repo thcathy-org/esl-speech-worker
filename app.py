@@ -1,10 +1,11 @@
 import os
 import logging
+import hmac
 import subprocess
 import soundfile as sf
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from typing import Optional
 
@@ -21,6 +22,7 @@ align_model = None
 align_metadata = None
 whisper_model = None
 device = "cuda" if torch.cuda.is_available() else "cpu"
+API_KEY = os.getenv("ESL_SPEECH_WORKER_API_KEY", "")
 
 # Kokoro assets are not shipped via PyPI; you must provide them.
 KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "kokoro-v1.0.onnx")
@@ -55,6 +57,8 @@ async def startup_event():
     global kokoro, align_model, align_metadata, whisper_model
     
     logger.info(f"Starting up on device: {device}")
+    if not API_KEY:
+        logger.warning("ESL_SPEECH_WORKER_API_KEY is not set")
     
     model_candidates = [
         KOKORO_MODEL_PATH,
@@ -113,10 +117,15 @@ class GenerateRequest(BaseModel):
 
 @app.post("/generate")
 async def generate_audio(
+    request_obj: Request,
     request: GenerateRequest,
 ):
     if not kokoro or not align_model or not whisper_model:
         raise HTTPException(status_code=503, detail="Models not loaded")
+    if API_KEY:
+        provided = request_obj.headers.get("x-api-key", "")
+        if not provided or not hmac.compare_digest(provided, API_KEY):
+            raise HTTPException(status_code=401, detail="Invalid API key")
 
     processed_text = request.text
     logger.info(f"Generating audio for: {processed_text[:50]}...")

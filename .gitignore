@@ -6,6 +6,7 @@ __pycache__/
 
 .env
 .env.*
+rest-client.env.json
 
 kokoro-v1.0.onnx
 voices-v1.0.bin
