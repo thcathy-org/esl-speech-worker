@@ -16,7 +16,7 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: esl-speech-worker
-          image: localhost/esl-speech-worker:1.0.1
+          image: localhost/esl-speech-worker:1.0.2
           imagePullPolicy: Never
           ports:
             - name: http
@@ -35,6 +35,12 @@ spec:
               value: tiny.en
             - name: WHISPER_VAD_METHOD
               value: silero
+            - name: ESL_SPEECH_WORKER_DEVICE
+              value: cuda
+            - name: ESL_SPEECH_WORKER_LAZY_LOAD
+              value: "true"
+            - name: ESL_SPEECH_WORKER_IDLE_TIMEOUT_SECONDS
+              value: "180"
             - name: HF_HOME
               value: /cache/huggingface
             - name: TRANSFORMERS_CACHE

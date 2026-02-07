@@ -96,4 +96,8 @@ curl -sS https://homeserver.funfunspell.com/esl-speech-worker/healthz
 - Image tag used in `k8s/k8s-esl-rest-deploy.yaml` must match the local image tag (e.g. `localhost/esl-speech-worker:1.0.1`).
 - If `ESL_SPEECH_WORKER_API_KEY` is set, `/generate` requires header `X-API-KEY: <key>`.
 - If you rebuild the image with the same tag, Kubernetes will keep the old pod. Either bump the tag and `kubectl apply`, or run `kubectl rollout restart deploy/esl-speech-worker -n esl-speech-worker`.
+- Optional env controls:
+  - `ESL_SPEECH_WORKER_DEVICE`: `cpu` or `cuda`
+  - `ESL_SPEECH_WORKER_LAZY_LOAD`: `true` to load models on first request
+  - `ESL_SPEECH_WORKER_IDLE_TIMEOUT_SECONDS`: unload models after idle time (0 disables)
 

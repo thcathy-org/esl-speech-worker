@@ -2,6 +2,8 @@ import os
 import logging
 import hmac
 import subprocess
+import asyncio
+import time
 import soundfile as sf
 import numpy as np
 import torch
@@ -21,7 +23,23 @@ kokoro: Kokoro = None
 align_model = None
 align_metadata = None
 whisper_model = None
-device = "cuda" if torch.cuda.is_available() else "cpu"
+models_loaded = False
+models_lock = asyncio.Lock()
+last_request_at = None
+
+_device_override = os.getenv("ESL_SPEECH_WORKER_DEVICE", "").strip().lower()
+if _device_override in {"cpu", "cuda"}:
+    device = _device_override
+else:
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+lazy_load_models = os.getenv("ESL_SPEECH_WORKER_LAZY_LOAD", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+idle_timeout_seconds = int(os.getenv("ESL_SPEECH_WORKER_IDLE_TIMEOUT_SECONDS", "0").strip() or "0")
 API_KEY = os.getenv("ESL_SPEECH_WORKER_API_KEY", "")
 
 # Kokoro assets are not shipped via PyPI; you must provide them.
@@ -40,6 +58,8 @@ async def healthz():
         "ok": True,
         "device": device,
         "cuda_available": torch.cuda.is_available(),
+        "lazy_load": lazy_load_models,
+        "models_loaded": models_loaded,
     }
 
 @app.get("/readyz")
@@ -48,18 +68,18 @@ async def readyz():
     Readiness probe: models are loaded and service can handle requests.
     """
     ready = bool(kokoro) and bool(align_model) and bool(whisper_model)
-    if not ready:
+    if not ready and not lazy_load_models:
         raise HTTPException(status_code=503, detail="Not ready: models not loaded")
-    return {"ok": True}
+    return {"ok": True, "models_loaded": ready}
 
-@app.on_event("startup")
-async def startup_event():
-    global kokoro, align_model, align_metadata, whisper_model
-    
+def _load_models():
+    global kokoro, align_model, align_metadata, whisper_model, models_loaded
+    if models_loaded:
+        return
     logger.info(f"Starting up on device: {device}")
     if not API_KEY:
         logger.warning("ESL_SPEECH_WORKER_API_KEY is not set")
-    
+
     model_candidates = [
         KOKORO_MODEL_PATH,
         "kokoro-v1.0.onnx",
@@ -85,7 +105,7 @@ async def startup_event():
 
     try:
         align_model, align_metadata = whisperx.load_align_model(
-            language_code="en", 
+            language_code="en",
             device=device
         )
         logger.info("WhisperX Alignment model loaded.")
@@ -107,6 +127,53 @@ async def startup_event():
     except Exception as e:
         logger.error(f"Failed to load Whisper model {WHISPER_MODEL_NAME}: {e}")
 
+    models_loaded = bool(kokoro) and bool(align_model) and bool(whisper_model)
+
+def _unload_models():
+    global kokoro, align_model, align_metadata, whisper_model, models_loaded
+    kokoro = None
+    align_model = None
+    align_metadata = None
+    whisper_model = None
+    models_loaded = False
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    logger.info("Models unloaded due to idle timeout.")
+
+async def _ensure_models_loaded():
+    if models_loaded:
+        return
+    async with models_lock:
+        if models_loaded:
+            return
+        await asyncio.to_thread(_load_models)
+
+async def _idle_unload_loop():
+    if idle_timeout_seconds <= 0:
+        return
+    check_interval = max(5, min(30, idle_timeout_seconds // 3))
+    while True:
+        await asyncio.sleep(check_interval)
+        if not models_loaded or last_request_at is None:
+            continue
+        idle_for = time.monotonic() - last_request_at
+        if idle_for >= idle_timeout_seconds:
+            async with models_lock:
+                if models_loaded and last_request_at is not None:
+                    idle_for = time.monotonic() - last_request_at
+                    if idle_for >= idle_timeout_seconds:
+                        await asyncio.to_thread(_unload_models)
+
+@app.on_event("startup")
+async def startup_event():
+    if lazy_load_models:
+        logger.info("Lazy model loading enabled; deferring model load until first request.")
+    else:
+        await _ensure_models_loaded()
+    if idle_timeout_seconds > 0:
+        logger.info(f"Idle unload enabled: {idle_timeout_seconds}s")
+        asyncio.create_task(_idle_unload_loop())
+
 class GenerateRequest(BaseModel):
     text: str
     voice: Optional[str] = DEFAULT_VOICE
@@ -120,6 +187,10 @@ async def generate_audio(
     request_obj: Request,
     request: GenerateRequest,
 ):
+    global last_request_at
+    last_request_at = time.monotonic()
+    if not kokoro or not align_model or not whisper_model:
+        await _ensure_models_loaded()
     if not kokoro or not align_model or not whisper_model:
         raise HTTPException(status_code=503, detail="Models not loaded")
     if API_KEY:
