@@ -107,6 +107,29 @@ def _encode_audio(
     finally:
         _safe_remove(mp3_path)
 
+def _align_timestamps(audio, batch_size: int = 16) -> list:
+    result = whisper_model.transcribe(audio, batch_size=batch_size)
+    segments = result.get("segments") or []
+    if not segments:
+        logger.warning("No speech detected in audio; skipping alignment.")
+        return []
+
+    try:
+        result_aligned = whisperx.align(
+            segments,
+            align_model,
+            align_metadata,
+            audio,
+            device,
+            return_char_alignments=False
+        )
+        return result_aligned.get("word_segments") or []
+    except Exception as e:
+        if "list index out of range" in str(e):
+            logger.warning("Alignment failed on short audio; returning empty timestamps.")
+            return []
+        raise
+
 @app.get("/healthz")
 async def healthz():
     """
@@ -243,26 +266,9 @@ async def generate_audio(
         tmp_path = tmp_audio.name
     try:
         # WhisperX alignment expects segments; we transcribe first, then align.
-        batch_size = 16
-
         audio = whisperx.load_audio(tmp_path)
         
-        result = whisper_model.transcribe(audio, batch_size=batch_size)
-        segments = result.get("segments") or []
-        if not segments:
-            logger.warning("No speech detected in audio; skipping alignment.")
-            timestamps = []
-        else:
-            result_aligned = whisperx.align(
-                segments,
-                align_model,
-                align_metadata,
-                audio,
-                device,
-                return_char_alignments=False
-            )
-
-            timestamps = result_aligned["word_segments"]
+        timestamps = _align_timestamps(audio)
     except Exception as e:
         logger.error(f"Alignment failed: {e}")
         _safe_remove(tmp_path)
