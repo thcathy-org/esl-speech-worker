@@ -216,7 +216,12 @@ async def generate_audio(
         raise HTTPException(status_code=503, detail="Models not loaded")
     _require_api_key(request_obj)
 
-    processed_text = request.text
+    if not request.text or not request.text.strip():
+        raise HTTPException(status_code=400, detail="text must be non-empty")
+
+    voice = request.voice or DEFAULT_VOICE
+
+    processed_text = request.text.strip()
     logger.info(f"Generating audio for: {processed_text[:50]}...")
 
     try:
@@ -243,17 +248,21 @@ async def generate_audio(
         audio = whisperx.load_audio(tmp_path)
         
         result = whisper_model.transcribe(audio, batch_size=batch_size)
+        segments = result.get("segments") or []
+        if not segments:
+            logger.warning("No speech detected in audio; skipping alignment.")
+            timestamps = []
+        else:
+            result_aligned = whisperx.align(
+                segments,
+                align_model,
+                align_metadata,
+                audio,
+                device,
+                return_char_alignments=False
+            )
 
-        result_aligned = whisperx.align(
-            result["segments"],
-            align_model,
-            align_metadata,
-            audio,
-            device,
-            return_char_alignments=False
-        )
-
-        timestamps = result_aligned["word_segments"]
+            timestamps = result_aligned["word_segments"]
     except Exception as e:
         logger.error(f"Alignment failed: {e}")
         _safe_remove(tmp_path)
