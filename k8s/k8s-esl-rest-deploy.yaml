@@ -16,7 +16,7 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: esl-speech-worker
-          image: localhost/esl-speech-worker:1.0.10
+          image: localhost/esl-speech-worker:1.0.11
           imagePullPolicy: Never
           ports:
             - name: http

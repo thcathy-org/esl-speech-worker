@@ -108,13 +108,13 @@ def _encode_audio(
         _safe_remove(mp3_path)
 
 def _align_timestamps(audio, batch_size: int = 16) -> list:
-    result = whisper_model.transcribe(audio, batch_size=batch_size)
-    segments = result.get("segments") or []
-    if not segments:
-        logger.warning("No speech detected in audio; skipping alignment.")
-        return []
-
     try:
+        result = whisper_model.transcribe(audio, batch_size=batch_size)
+        segments = result.get("segments") or []
+        if not segments:
+            logger.warning("No speech detected in audio; skipping alignment.")
+            return []
+
         result_aligned = whisperx.align(
             segments,
             align_model,
