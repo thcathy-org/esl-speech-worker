@@ -5,6 +5,11 @@ metadata:
   namespace: esl-speech-worker
 spec:
   replicas: 1
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: esl-speech-worker
@@ -16,7 +21,7 @@ spec:
       runtimeClassName: nvidia
       containers:
         - name: esl-speech-worker
-          image: localhost/esl-speech-worker:1.0.11
+          image: localhost/esl-speech-worker:1.0.16
           imagePullPolicy: Never
           ports:
             - name: http
@@ -33,52 +38,38 @@ spec:
                 secretKeyRef:
                   name: esl-speech-worker-api-key
                   key: api-key
-            - name: WHISPER_MODEL_NAME
-              value: tiny.en
-            - name: WHISPER_VAD_METHOD
-              value: silero
-            - name: HF_HOME
-              value: /cache/huggingface
-            - name: TRANSFORMERS_CACHE
-              value: /cache/huggingface/transformers
-            - name: XDG_CACHE_HOME
-              value: /cache
           volumeMounts:
-            - name: cache
-              mountPath: /cache
             - name: models
               mountPath: /models
               readOnly: true
           resources:
             limits:
               nvidia.com/gpu: "1"
-              memory: "4Gi"
+              memory: "24Gi"
             requests:
               memory: "2Gi"
           startupProbe:
             httpGet:
               path: /healthz
               port: 8000
-            periodSeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 180
           readinessProbe:
             httpGet:
               path: /readyz
               port: 8000
-            periodSeconds: 60
-            timeoutSeconds: 2
-            failureThreshold: 1
+            periodSeconds: 30
+            timeoutSeconds: 30
+            failureThreshold: 6
           livenessProbe:
             httpGet:
               path: /healthz
               port: 8000
             periodSeconds: 60
-            timeoutSeconds: 2
-            failureThreshold: 3
+            timeoutSeconds: 30
+            failureThreshold: 5
       volumes:
-        - name: cache
-          persistentVolumeClaim:
-            claimName: esl-speech-worker-cache
         - name: models
           persistentVolumeClaim:
             claimName: esl-speech-worker-models

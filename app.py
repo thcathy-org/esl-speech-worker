@@ -7,13 +7,13 @@ import base64
 import tempfile
 from typing import Optional
 
+import numpy as np
 import soundfile as sf
 import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 from kokoro_onnx import Kokoro
-import whisperx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,9 +21,6 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="ESL Speech Worker")
 
 kokoro: Kokoro = None
-align_model = None
-align_metadata = None
-whisper_model = None
 models_loaded = False
 models_lock = asyncio.Lock()
 
@@ -31,8 +28,10 @@ API_KEY = os.getenv("ESL_SPEECH_WORKER_API_KEY", "")
 KOKORO_MODEL_PATH = os.getenv("KOKORO_MODEL_PATH", "kokoro-v1.0.onnx")
 KOKORO_VOICES_PATH = os.getenv("KOKORO_VOICES_PATH", "voices-v1.0.bin")
 DEFAULT_VOICE = "af_sarah"
-WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "tiny.en")
-WHISPER_VAD_METHOD = os.getenv("WHISPER_VAD_METHOD", "silero")
+MAX_TTS_WORDS_PER_CHUNK = int(os.getenv("MAX_TTS_WORDS_PER_CHUNK", "50"))
+
+def _models_ready() -> bool:
+    return bool(kokoro)
 
 def _resolve_device() -> str:
     forced = os.getenv("ESL_SPEECH_WORKER_DEVICE", "").strip().lower()
@@ -107,29 +106,6 @@ def _encode_audio(
     finally:
         _safe_remove(mp3_path)
 
-def _align_timestamps(audio, batch_size: int = 16) -> list:
-    try:
-        result = whisper_model.transcribe(audio, batch_size=batch_size)
-        segments = result.get("segments") or []
-        if not segments:
-            logger.warning("No speech detected in audio; skipping alignment.")
-            return []
-
-        result_aligned = whisperx.align(
-            segments,
-            align_model,
-            align_metadata,
-            audio,
-            device,
-            return_char_alignments=False
-        )
-        return result_aligned.get("word_segments") or []
-    except Exception as e:
-        if "list index out of range" in str(e):
-            logger.warning("Alignment failed on short audio; returning empty timestamps.")
-            return []
-        raise
-
 @app.get("/healthz")
 async def healthz():
     """
@@ -147,13 +123,13 @@ async def readyz():
     """
     Readiness probe: models are loaded and service can handle requests.
     """
-    ready = bool(kokoro) and bool(align_model) and bool(whisper_model)
+    ready = _models_ready()
     if not ready:
         raise HTTPException(status_code=503, detail="Not ready: models not loaded")
     return {"ok": True, "models_loaded": ready}
 
 def _load_models():
-    global kokoro, align_model, align_metadata, whisper_model, models_loaded
+    global kokoro, models_loaded
     if models_loaded:
         return
     logger.info(f"Starting up on device: {device}")
@@ -183,31 +159,7 @@ def _load_models():
             f"Looked for model in {model_candidates} and voices in {voices_candidates}."
         )
 
-    try:
-        align_model, align_metadata = whisperx.load_align_model(
-            language_code="en",
-            device=device,
-        )
-        logger.info("WhisperX Alignment model loaded.")
-    except Exception as e:
-        logger.error(f"Failed to load WhisperX: {e}")
-
-    try:
-        compute_type = "float16" if device == "cuda" else "int8"
-        whisper_model = whisperx.load_model(
-            WHISPER_MODEL_NAME,
-            device,
-            compute_type=compute_type,
-            vad_method=WHISPER_VAD_METHOD,
-        )
-        logger.info(
-            f"Whisper model loaded: {WHISPER_MODEL_NAME} "
-            f"(compute_type={compute_type}, vad_method={WHISPER_VAD_METHOD})"
-        )
-    except Exception as e:
-        logger.error(f"Failed to load Whisper model {WHISPER_MODEL_NAME}: {e}")
-
-    models_loaded = bool(kokoro) and bool(align_model) and bool(whisper_model)
+    models_loaded = _models_ready()
 
 async def _ensure_models_loaded():
     if models_loaded:
@@ -228,35 +180,104 @@ class GenerateRequest(BaseModel):
     audio_format: Optional[str] = "mp3"
     mp3_quality: Optional[int] = 4
 
-@app.post("/generate")
-async def generate_audio(
-    request_obj: Request,
-    request: GenerateRequest,
-):
-    if not kokoro or not align_model or not whisper_model:
-        await _ensure_models_loaded()
-    if not kokoro or not align_model or not whisper_model:
-        raise HTTPException(status_code=503, detail="Models not loaded")
-    _require_api_key(request_obj)
+def _parse_speed(value: Optional[float]) -> float:
+    try:
+        raw = value if value is not None else 1.0
+        return _clamp(float(raw), 0.5, 1.5)
+    except Exception:
+        raise HTTPException(status_code=400, detail="speed must be a number")
 
-    if not request.text or not request.text.strip():
+def _validate_and_normalize_text(text: str) -> str:
+    processed_text = (text or "").strip()
+    if not processed_text:
         raise HTTPException(status_code=400, detail="text must be non-empty")
+    return processed_text
 
-    voice = request.voice or DEFAULT_VOICE
+def _split_text_for_tts(text: str) -> list[str]:
+    words = (text or "").split()
+    if not words:
+        return []
 
-    processed_text = request.text.strip()
-    logger.info(f"Generating audio for: {processed_text[:50]}...")
+    chunk_size = max(1, MAX_TTS_WORDS_PER_CHUNK)
+    word_chunks = [
+        words[i:i + chunk_size]
+        for i in range(0, len(words), chunk_size)
+    ]
+
+    if len(word_chunks) > 1 and len(word_chunks[-1]) < 10:
+        word_chunks[-2].extend(word_chunks[-1])
+        word_chunks.pop()
+
+    return [" ".join(chunk) for chunk in word_chunks]
+
+def _resample_audio(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate or samples.size == 0:
+        return samples
+
+    if samples.ndim == 1:
+        source_positions = np.linspace(0, samples.shape[0] - 1, num=samples.shape[0])
+        target_length = max(1, int(round(samples.shape[0] * target_rate / source_rate)))
+        target_positions = np.linspace(0, samples.shape[0] - 1, num=target_length)
+        return np.interp(target_positions, source_positions, samples).astype(np.float32, copy=False)
+
+    if samples.ndim == 2:
+        source_positions = np.linspace(0, samples.shape[0] - 1, num=samples.shape[0])
+        target_length = max(1, int(round(samples.shape[0] * target_rate / source_rate)))
+        target_positions = np.linspace(0, samples.shape[0] - 1, num=target_length)
+        channels = [
+            np.interp(target_positions, source_positions, samples[:, channel_idx])
+            for channel_idx in range(samples.shape[1])
+        ]
+        return np.stack(channels, axis=1).astype(np.float32, copy=False)
+
+    return samples.astype(np.float32, copy=False)
+
+async def _require_models_loaded() -> None:
+    if not _models_ready():
+        await _ensure_models_loaded()
+    if not _models_ready():
+        raise HTTPException(status_code=503, detail="Models not loaded")
+
+def _generate_audio_sync(
+    processed_text: str,
+    voice: str,
+    speed: float,
+    audio_format: str,
+    mp3_quality: Optional[int],
+) -> tuple[bytes, str, int, str]:
+    text_chunks = _split_text_for_tts(processed_text)
+
+    logger.info(f"Splitting TTS request into {len(text_chunks)} chunks to avoid phoneme truncation")
+
+    all_samples: list[np.ndarray] = []
+    sample_rate: Optional[int] = None
 
     try:
-        speed = request.speed if request.speed is not None else 1.0
-        speed = _clamp(float(speed), 0.5, 1.5)
+        for chunk in text_chunks:
+            chunk_samples, chunk_sample_rate = kokoro.create(
+                chunk,
+                voice=voice,
+                speed=speed,
+                lang="en-us"
+            )
+            chunk_samples_np = np.asarray(chunk_samples, dtype=np.float32)
+            if sample_rate is None:
+                sample_rate = int(chunk_sample_rate)
+            elif sample_rate != chunk_sample_rate:
+                logger.warning(
+                    f"Resampling chunk from {chunk_sample_rate} Hz to {sample_rate} Hz"
+                )
+                chunk_samples_np = _resample_audio(
+                    chunk_samples_np,
+                    int(chunk_sample_rate),
+                    sample_rate,
+                )
+            all_samples.append(chunk_samples_np)
 
-        samples, sample_rate = kokoro.create(
-            processed_text,
-            voice=request.voice,
-            speed=speed,
-            lang="en-us"
-        )
+        if not all_samples:
+            raise HTTPException(status_code=500, detail="No audio generated")
+
+        samples = all_samples[0] if len(all_samples) == 1 else np.concatenate(all_samples)
     except Exception as e:
         logger.error(f"TTS Generation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -264,25 +285,44 @@ async def generate_audio(
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
         sf.write(tmp_audio.name, samples, sample_rate)
         tmp_path = tmp_audio.name
-    try:
-        # WhisperX alignment expects segments; we transcribe first, then align.
-        audio = whisperx.load_audio(tmp_path)
-        
-        timestamps = _align_timestamps(audio)
-    except Exception as e:
-        logger.error(f"Alignment failed: {e}")
-        _safe_remove(tmp_path)
-        raise HTTPException(status_code=500, detail=f"Alignment failed: {str(e)}")
 
     try:
         audio_bytes, mime_type = _encode_audio(
-            request.audio_format,
+            audio_format,
             tmp_path,
-            request.mp3_quality,
+            mp3_quality,
         )
-        audio_format = (request.audio_format or "mp3").lower().strip()
+        normalized_audio_format = (audio_format or "mp3").lower().strip()
+    except Exception as e:
+        logger.error(f"Audio post-processing failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Audio generation failed: {str(e)}")
     finally:
         _safe_remove(tmp_path)
+
+    return audio_bytes, mime_type, sample_rate, normalized_audio_format
+
+@app.post("/generate")
+async def generate_audio(
+    request_obj: Request,
+    request: GenerateRequest,
+):
+    await _require_models_loaded()
+    _require_api_key(request_obj)
+
+    voice = request.voice or DEFAULT_VOICE
+    processed_text = _validate_and_normalize_text(request.text)
+    logger.info(f"Generating audio for: {processed_text[:50]}...")
+
+    speed = _parse_speed(request.speed)
+
+    audio_bytes, mime_type, sample_rate, audio_format = await asyncio.to_thread(
+        _generate_audio_sync,
+        processed_text,
+        voice,
+        speed,
+        request.audio_format,
+        request.mp3_quality,
+    )
 
     audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
 
@@ -291,7 +331,6 @@ async def generate_audio(
         "audio_format": audio_format,
         "mime_type": mime_type,
         "sample_rate": sample_rate,
-        "word_timestamps": timestamps,
         "original_text": request.text,
         "processed_text": processed_text,
     }

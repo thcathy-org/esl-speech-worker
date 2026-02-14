@@ -1,6 +1,6 @@
 # ESL Speech Worker
 
-FastAPI service that generates TTS audio and word-level timestamps (Kokoro + WhisperX).
+FastAPI service that generates TTS audio with Kokoro.
 
 This service is supporting https://www.funfunspell.com - a free platform for English dictation and learning vocabulary
 
@@ -98,6 +98,4 @@ curl -sS https://homeserver.funfunspell.com/esl-speech-worker/healthz
 - If you rebuild the image with the same tag, Kubernetes will keep the old pod. Either bump the tag and `kubectl apply`, or run `kubectl rollout restart deploy/esl-speech-worker -n esl-speech-worker`.
 - Optional env controls:
   - `ESL_SPEECH_WORKER_DEVICE`: `cpu` or `cuda`
-  - `ESL_SPEECH_WORKER_LAZY_LOAD`: `true` to load models on first request
-  - `ESL_SPEECH_WORKER_IDLE_TIMEOUT_SECONDS`: unload models after idle time (0 disables)
 
