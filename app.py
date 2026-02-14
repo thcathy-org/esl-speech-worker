@@ -9,7 +9,6 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-import torch
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
@@ -32,14 +31,6 @@ MAX_TTS_WORDS_PER_CHUNK = int(os.getenv("MAX_TTS_WORDS_PER_CHUNK", "50"))
 
 def _models_ready() -> bool:
     return bool(kokoro)
-
-def _resolve_device() -> str:
-    forced = os.getenv("ESL_SPEECH_WORKER_DEVICE", "").strip().lower()
-    if forced in ("cpu", "cuda"):
-        return forced
-    return "cuda" if torch.cuda.is_available() else "cpu"
-
-device = _resolve_device()
 
 def _clamp(value: float, min_value: float, max_value: float) -> float:
     return max(min_value, min(max_value, value))
@@ -113,8 +104,6 @@ async def healthz():
     """
     return {
         "ok": True,
-        "device": device,
-        "cuda_available": torch.cuda.is_available(),
         "models_loaded": models_loaded,
     }
 
@@ -132,7 +121,7 @@ def _load_models():
     global kokoro, models_loaded
     if models_loaded:
         return
-    logger.info(f"Starting up on device: {device}")
+    logger.info("Starting up (CPU-only mode)")
     if not API_KEY:
         logger.warning("ESL_SPEECH_WORKER_API_KEY is not set")
 

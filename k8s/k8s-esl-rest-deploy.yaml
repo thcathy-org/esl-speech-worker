@@ -18,7 +18,6 @@ spec:
       labels:
         app: esl-speech-worker
     spec:
-      runtimeClassName: nvidia
       containers:
         - name: esl-speech-worker
           image: localhost/esl-speech-worker:1.0.16
@@ -31,8 +30,6 @@ spec:
               value: /models/kokoro-v1.0.onnx
             - name: KOKORO_VOICES_PATH
               value: /models/voices-v1.0.bin
-            - name: ESL_SPEECH_WORKER_DEVICE
-              value: cuda
             - name: ESL_SPEECH_WORKER_API_KEY
               valueFrom:
                 secretKeyRef:
@@ -44,7 +41,6 @@ spec:
               readOnly: true
           resources:
             limits:
-              nvidia.com/gpu: "1"
               memory: "24Gi"
             requests:
               memory: "2Gi"

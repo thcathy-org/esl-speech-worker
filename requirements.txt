@@ -3,6 +3,5 @@ uvicorn==0.27.1
 python-multipart==0.0.9
 kokoro-onnx==0.4.9
 soundfile==0.12.1
-numpy==1.26.4
+numpy==2.0.2
 scipy==1.14.1
-# Torch is intentionally not pinned here; the CUDA base image provides it.
